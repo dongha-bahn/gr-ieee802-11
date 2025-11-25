@@ -15,6 +15,11 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+/*
+ * Modified for CSI extraction support for ISAC research
+ * Added "csi" message port to output channel state information
+ */
+
 #include "equalizer/base.h"
 #include "equalizer/comb.h"
 #include "equalizer/lms.h"
@@ -23,6 +28,7 @@
 #include "frame_equalizer_impl.h"
 #include "utils.h"
 #include <gnuradio/io_signature.h>
+#include <chrono>
 
 namespace gr {
 namespace ieee802_11 {
@@ -52,6 +58,12 @@ frame_equalizer_impl::frame_equalizer_impl(
 {
 
     message_port_register_out(pmt::mp("symbols"));
+
+    // =========================================================================
+    // CSI OUTPUT PORT - Added for ISAC/sensing applications
+    // This port outputs the channel state information (CSI) for each frame
+    // =========================================================================
+    message_port_register_out(pmt::mp("csi"));
 
     d_bpsk = constellation_bpsk::make();
     d_qpsk = constellation_qpsk::make();
@@ -211,6 +223,33 @@ int frame_equalizer_impl::general_work(int noutput_items,
         // do equalization
         d_equalizer->equalize(
             current_symbol, d_current_symbol, symbols, out + o * 48, d_frame_mod);
+
+        // =====================================================================
+        // CSI OUTPUT - Publish CSI after LTF processing (symbol 1)
+        // This outputs CSI for ALL detected frames, not just successfully decoded ones
+        // Useful for sensing applications where you want maximum CSI samples
+        // =====================================================================
+        if (d_current_symbol == 1) {
+            // Get CSI from equalizer (channel estimate d_H)
+            std::vector<gr_complex> csi = d_equalizer->get_csi();
+            
+            // Get current timestamp
+            auto now = std::chrono::system_clock::now();
+            auto duration = now.time_since_epoch();
+            double timestamp = std::chrono::duration<double>(duration).count();
+            
+            // Create metadata dictionary
+            pmt::pmt_t meta = pmt::make_dict();
+            meta = pmt::dict_add(meta, pmt::mp("timestamp"), pmt::from_double(timestamp));
+            meta = pmt::dict_add(meta, pmt::mp("frequency"), pmt::from_double(d_freq));
+            meta = pmt::dict_add(meta, pmt::mp("bandwidth"), pmt::from_double(d_bw));
+            meta = pmt::dict_add(meta, pmt::mp("freq_offset"), pmt::from_double(d_freq_offset_from_synclong));
+            meta = pmt::dict_add(meta, pmt::mp("snr"), pmt::from_double(d_equalizer->get_snr()));
+            
+            // Publish CSI as message: (metadata_dict, csi_c32vector)
+            pmt::pmt_t csi_pmt = pmt::init_c32vector(csi.size(), csi);
+            message_port_pub(pmt::mp("csi"), pmt::cons(meta, csi_pmt));
+        }
 
         // signal field
         if (d_current_symbol == 2) {
