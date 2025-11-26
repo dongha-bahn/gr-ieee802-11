@@ -18,6 +18,9 @@
 /*
  * Modified for CSI extraction support for ISAC research
  * Added "csi" message port to output channel state information
+ * Added frame_id for correlation with MAC address from decode_mac
+ * 
+ * Version 2: Outputs CSI after signal field decode with frame_id
  */
 
 #include "equalizer/base.h"
@@ -32,6 +35,9 @@
 
 namespace gr {
 namespace ieee802_11 {
+
+// Static frame counter for correlation with decode_mac
+static uint64_t s_frame_id = 0;
 
 frame_equalizer::sptr
 frame_equalizer::make(Equalizer algo, double freq, double bw, bool log, bool debug)
@@ -159,6 +165,9 @@ int frame_equalizer_impl::general_work(int noutput_items,
             d_epsilon0 = pmt::to_double(tags.front().value) * d_bw / (2 * M_PI * d_freq);
             d_er = 0;
 
+            // Increment frame counter for new frame
+            s_frame_id++;
+
             dout << "epsilon: " << d_epsilon0 << std::endl;
         }
 
@@ -224,37 +233,40 @@ int frame_equalizer_impl::general_work(int noutput_items,
         d_equalizer->equalize(
             current_symbol, d_current_symbol, symbols, out + o * 48, d_frame_mod);
 
-        // =====================================================================
-        // CSI OUTPUT - Publish CSI after LTF processing (symbol 1)
-        // This outputs CSI for ALL detected frames, not just successfully decoded ones
-        // Useful for sensing applications where you want maximum CSI samples
-        // =====================================================================
-        if (d_current_symbol == 1) {
-            // Get CSI from equalizer (channel estimate d_H)
-            std::vector<gr_complex> csi = d_equalizer->get_csi();
-            
-            // Get current timestamp
-            auto now = std::chrono::system_clock::now();
-            auto duration = now.time_since_epoch();
-            double timestamp = std::chrono::duration<double>(duration).count();
-            
-            // Create metadata dictionary
-            pmt::pmt_t meta = pmt::make_dict();
-            meta = pmt::dict_add(meta, pmt::mp("timestamp"), pmt::from_double(timestamp));
-            meta = pmt::dict_add(meta, pmt::mp("frequency"), pmt::from_double(d_freq));
-            meta = pmt::dict_add(meta, pmt::mp("bandwidth"), pmt::from_double(d_bw));
-            meta = pmt::dict_add(meta, pmt::mp("freq_offset"), pmt::from_double(d_freq_offset_from_synclong));
-            meta = pmt::dict_add(meta, pmt::mp("snr"), pmt::from_double(d_equalizer->get_snr()));
-            
-            // Publish CSI as message: (metadata_dict, csi_c32vector)
-            pmt::pmt_t csi_pmt = pmt::init_c32vector(csi.size(), csi);
-            message_port_pub(pmt::mp("csi"), pmt::cons(meta, csi_pmt));
-        }
-
         // signal field
         if (d_current_symbol == 2) {
 
             if (decode_signal_field(out + o * 48)) {
+                
+                // =====================================================================
+                // CSI OUTPUT - After successful signal field decode
+                // Now we know the frame is valid, output CSI with frame_id
+                // frame_id can be used to correlate with MAC address from decode_mac
+                // =====================================================================
+                {
+                    // Get CSI from equalizer
+                    std::vector<gr_complex> csi = d_equalizer->get_csi();
+                    
+                    // Get current timestamp
+                    auto now = std::chrono::system_clock::now();
+                    auto duration = now.time_since_epoch();
+                    double timestamp = std::chrono::duration<double>(duration).count();
+                    
+                    // Create metadata dictionary with frame_id for correlation
+                    pmt::pmt_t meta = pmt::make_dict();
+                    meta = pmt::dict_add(meta, pmt::mp("timestamp"), pmt::from_double(timestamp));
+                    meta = pmt::dict_add(meta, pmt::mp("frame_id"), pmt::from_uint64(s_frame_id));
+                    meta = pmt::dict_add(meta, pmt::mp("frequency"), pmt::from_double(d_freq));
+                    meta = pmt::dict_add(meta, pmt::mp("bandwidth"), pmt::from_double(d_bw));
+                    meta = pmt::dict_add(meta, pmt::mp("freq_offset"), pmt::from_double(d_freq_offset_from_synclong));
+                    meta = pmt::dict_add(meta, pmt::mp("snr"), pmt::from_double(d_equalizer->get_snr()));
+                    meta = pmt::dict_add(meta, pmt::mp("encoding"), pmt::from_uint64(d_frame_encoding));
+                    meta = pmt::dict_add(meta, pmt::mp("frame_bytes"), pmt::from_uint64(d_frame_bytes));
+                    
+                    // Publish CSI as message: (metadata_dict, csi_c32vector)
+                    pmt::pmt_t csi_pmt = pmt::init_c32vector(csi.size(), csi);
+                    message_port_pub(pmt::mp("csi"), pmt::cons(meta, csi_pmt));
+                }
 
                 pmt::pmt_t dict = pmt::make_dict();
                 dict = pmt::dict_add(
@@ -269,6 +281,8 @@ int frame_equalizer_impl::general_work(int noutput_items,
                                      pmt::mp("frequency offset"),
                                      pmt::from_double(d_freq_offset_from_synclong));
                 dict = pmt::dict_add(dict, pmt::mp("beta"), pmt::from_double(beta));
+                // Add frame_id to tags for correlation
+                dict = pmt::dict_add(dict, pmt::mp("frame_id"), pmt::from_uint64(s_frame_id));
 
                 std::vector<gr_complex> csi = d_equalizer->get_csi();
                 dict = pmt::dict_add(
